@@ -2166,13 +2166,7 @@ app.get('/api/user/entries', verifyFirebaseToken, async (req, res) => {
     });
   }
 });
-app.get('/health', (req, res) => {
-  res.json({
-    success: true,
-    message: 'Server is running',
-    timestamp: new Date().toISOString()
-  });
-});
+
 
 // ==================== ERROR HANDLING & 404 ====================
 
