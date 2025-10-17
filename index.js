@@ -1692,27 +1692,6 @@ app.get('/api/docs', (req, res) => {
   
   res.json(apiDocs);
 });
-
-// ==================== ERROR HANDLING & 404 ====================
-
-// Handle 404
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'Route not found',
-    suggestion: 'Check /api/docs for available endpoints'
-  });
-});
-
-// Global error handler
-app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({
-    success: false,
-    message: 'Internal server error',
-    error: error.message
-  });
-});
 // ==================== FINGERPRINT MANAGEMENT ROUTES ====================
 
 // GET all fingerprints (Admin only)
@@ -2192,6 +2171,27 @@ app.get('/health', (req, res) => {
     success: true,
     message: 'Server is running',
     timestamp: new Date().toISOString()
+  });
+});
+
+// ==================== ERROR HANDLING & 404 ====================
+
+// Handle 404
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: 'Route not found',
+    suggestion: 'Check /api/docs for available endpoints'
+  });
+});
+
+// Global error handler
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error',
+    error: error.message
   });
 });
 
