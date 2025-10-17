@@ -1713,6 +1713,487 @@ app.use((error, req, res, next) => {
     error: error.message
   });
 });
+// ==================== FINGERPRINT MANAGEMENT ROUTES ====================
+
+// GET all fingerprints (Admin only)
+app.get('/api/fingerprints', verifyFirebaseToken, verifyAdminToken, async (req, res) => {
+  try {
+    const { firebase_uid } = req.query;
+    let query = `SELECT f.*, u.name, u.Phone, u.Address 
+                 FROM gym_fingerprints f
+                 LEFT JOIN gym_users u ON f.firebase_uid = u.firebase_uid
+                 WHERE 1=1`;
+    const params = [];
+
+    if (firebase_uid) {
+      query += ' AND f.firebase_uid = ?';
+      params.push(firebase_uid);
+    }
+
+    query += ' ORDER BY f.enrolled_at DESC';
+
+    const [rows] = await pool.execute(query, params);
+    
+    // Add user email from Firebase
+    const fingerprintsWithUserData = await Promise.all(
+      rows.map(async (fp) => {
+        try {
+          const firebaseUser = await admin.auth().getUser(fp.firebase_uid).catch(() => null);
+          return {
+            ...fp,
+            user_name: fp.name || firebaseUser?.displayName || 'Unknown User',
+            user_email: firebaseUser?.email || null
+          };
+        } catch (error) {
+          return {
+            ...fp,
+            user_name: fp.name || 'Unknown User',
+            user_email: null
+          };
+        }
+      })
+    );
+
+    res.json({
+      success: true,
+      data: fingerprintsWithUserData,
+      count: fingerprintsWithUserData.length
+    });
+  } catch (error) {
+    console.error('Error fetching fingerprints:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching fingerprints',
+      error: error.message
+    });
+  }
+});
+
+// GET user's own fingerprints
+app.get('/api/user/fingerprints', verifyFirebaseToken, async (req, res) => {
+  try {
+    const firebase_uid = req.user.uid;
+    
+    const [rows] = await pool.execute(
+      'SELECT * FROM gym_fingerprints WHERE firebase_uid = ? ORDER BY enrolled_at DESC',
+      [firebase_uid]
+    );
+
+    res.json({
+      success: true,
+      data: rows,
+      count: rows.length
+    });
+  } catch (error) {
+    console.error('Error fetching user fingerprints:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching fingerprints',
+      error: error.message
+    });
+  }
+});
+
+// POST - Enroll new fingerprint
+app.post('/api/fingerprints', verifyFirebaseToken, async (req, res) => {
+  try {
+    const { firebase_uid, fingerprint_template, fingerprint_id, finger_name } = req.body;
+    const currentUserUid = req.user.uid;
+
+    // Validation
+    if (!firebase_uid || !fingerprint_template || !fingerprint_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'firebase_uid, fingerprint_template, and fingerprint_id are required'
+      });
+    }
+
+    // Check if user is admin
+    const [adminCheck] = await pool.execute(
+      'SELECT is_admin FROM gym_users WHERE firebase_uid = ?',
+      [currentUserUid]
+    );
+    
+    const isAdmin = adminCheck.length > 0 && adminCheck[0].is_admin;
+
+    // Users can only enroll for themselves, admins can enroll for anyone
+    if (!isAdmin && firebase_uid !== currentUserUid) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: You can only enroll fingerprints for yourself'
+      });
+    }
+
+    // Check if fingerprint_id already exists
+    const [existingFingerprint] = await pool.execute(
+      'SELECT id FROM gym_fingerprints WHERE fingerprint_id = ?',
+      [fingerprint_id]
+    );
+
+    if (existingFingerprint.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'Fingerprint ID already exists'
+      });
+    }
+
+    // Insert new fingerprint
+    const [result] = await pool.execute(
+      `INSERT INTO gym_fingerprints 
+       (firebase_uid, fingerprint_template, fingerprint_id, finger_name, is_active) 
+       VALUES (?, ?, ?, ?, 1)`,
+      [firebase_uid, fingerprint_template, fingerprint_id, finger_name || 'Default']
+    );
+
+    // Fetch the created fingerprint
+    const [newFingerprint] = await pool.execute(
+      'SELECT * FROM gym_fingerprints WHERE id = ?',
+      [result.insertId]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Fingerprint enrolled successfully',
+      data: newFingerprint[0]
+    });
+  } catch (error) {
+    console.error('Error enrolling fingerprint:', error);
+    
+    if (error.code === 'ER_NO_REFERENCED_ROW_2') {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid firebase_uid - user does not exist'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: 'Error enrolling fingerprint',
+      error: error.message
+    });
+  }
+});
+
+// PUT - Update fingerprint
+app.put('/api/fingerprints/:id', verifyFirebaseToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { fingerprint_template, finger_name, is_active } = req.body;
+    const currentUserUid = req.user.uid;
+
+    // Check if fingerprint exists
+    const [existingFingerprint] = await pool.execute(
+      'SELECT * FROM gym_fingerprints WHERE id = ?',
+      [id]
+    );
+
+    if (existingFingerprint.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Fingerprint not found'
+      });
+    }
+
+    // Check if user is admin
+    const [adminCheck] = await pool.execute(
+      'SELECT is_admin FROM gym_users WHERE firebase_uid = ?',
+      [currentUserUid]
+    );
+    
+    const isAdmin = adminCheck.length > 0 && adminCheck[0].is_admin;
+
+    // Users can only update their own fingerprints
+    if (!isAdmin && existingFingerprint[0].firebase_uid !== currentUserUid) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: You can only update your own fingerprints'
+      });
+    }
+
+    // Build dynamic update query
+    const updates = [];
+    const params = [];
+
+    if (fingerprint_template !== undefined) {
+      updates.push('fingerprint_template = ?');
+      params.push(fingerprint_template);
+    }
+
+    if (finger_name !== undefined) {
+      updates.push('finger_name = ?');
+      params.push(finger_name);
+    }
+
+    if (is_active !== undefined) {
+      updates.push('is_active = ?');
+      params.push(is_active ? 1 : 0);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid fields to update'
+      });
+    }
+
+    params.push(id);
+
+    await pool.execute(
+      `UPDATE gym_fingerprints SET ${updates.join(', ')} WHERE id = ?`,
+      params
+    );
+
+    // Fetch updated fingerprint
+    const [updatedFingerprint] = await pool.execute(
+      'SELECT * FROM gym_fingerprints WHERE id = ?',
+      [id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Fingerprint updated successfully',
+      data: updatedFingerprint[0]
+    });
+  } catch (error) {
+    console.error('Error updating fingerprint:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating fingerprint',
+      error: error.message
+    });
+  }
+});
+
+// DELETE - Delete fingerprint
+app.delete('/api/fingerprints/:id', verifyFirebaseToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const currentUserUid = req.user.uid;
+
+    // Check if fingerprint exists
+    const [existingFingerprint] = await pool.execute(
+      'SELECT * FROM gym_fingerprints WHERE id = ?',
+      [id]
+    );
+
+    if (existingFingerprint.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Fingerprint not found'
+      });
+    }
+
+    // Check if user is admin
+    const [adminCheck] = await pool.execute(
+      'SELECT is_admin FROM gym_users WHERE firebase_uid = ?',
+      [currentUserUid]
+    );
+    
+    const isAdmin = adminCheck.length > 0 && adminCheck[0].is_admin;
+
+    // Users can only delete their own fingerprints
+    if (!isAdmin && existingFingerprint[0].firebase_uid !== currentUserUid) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: You can only delete your own fingerprints'
+      });
+    }
+
+    await pool.execute('DELETE FROM gym_fingerprints WHERE id = ?', [id]);
+
+    res.json({
+      success: true,
+      message: 'Fingerprint deleted successfully',
+      data: existingFingerprint[0]
+    });
+  } catch (error) {
+    console.error('Error deleting fingerprint:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting fingerprint',
+      error: error.message
+    });
+  }
+});
+
+// POST - Verify fingerprint and log entry
+app.post('/api/fingerprints/verify', async (req, res) => {
+  try {
+    const { fingerprint_id } = req.body;
+
+    if (!fingerprint_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'fingerprint_id is required'
+      });
+    }
+
+    // Find fingerprint
+    const [fingerprints] = await pool.execute(
+      `SELECT f.*, u.name, u.Phone 
+       FROM gym_fingerprints f
+       LEFT JOIN gym_users u ON f.firebase_uid = u.firebase_uid
+       WHERE f.fingerprint_id = ? AND f.is_active = 1`,
+      [fingerprint_id]
+    );
+
+    if (fingerprints.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Fingerprint not found or inactive'
+      });
+    }
+
+    const fingerprint = fingerprints[0];
+
+    // Check if user has active plan
+    const [activePlans] = await pool.execute(
+      `SELECT * FROM gym_plans 
+       WHERE firebase_uid = ? 
+       AND status = 'Active' 
+       AND start_date <= CURDATE() 
+       AND end_date >= CURDATE()`,
+      [fingerprint.firebase_uid]
+    );
+
+    const hasActivePlan = activePlans.length > 0;
+
+    // Log entry
+    const [result] = await pool.execute(
+      `INSERT INTO gym_entries 
+       (firebase_uid, fingerprint_id, entry_status, has_active_plan) 
+       VALUES (?, ?, ?, ?)`,
+      [
+        fingerprint.firebase_uid, 
+        fingerprint_id, 
+        hasActivePlan ? 'allowed' : 'denied',
+        hasActivePlan ? 1 : 0
+      ]
+    );
+
+    // Get entry details
+    const [entry] = await pool.execute(
+      'SELECT * FROM gym_entries WHERE id = ?',
+      [result.insertId]
+    );
+
+    res.json({
+      success: true,
+      message: hasActivePlan ? 'Access granted' : 'Access denied - No active plan',
+      data: {
+        entry: entry[0],
+        user: {
+          firebase_uid: fingerprint.firebase_uid,
+          name: fingerprint.name,
+          phone: fingerprint.Phone
+        },
+        access_granted: hasActivePlan,
+        active_plans: activePlans
+      }
+    });
+  } catch (error) {
+    console.error('Error verifying fingerprint:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error verifying fingerprint',
+      error: error.message
+    });
+  }
+});
+
+// GET all entry logs (Admin only)
+app.get('/api/entries', verifyFirebaseToken, verifyAdminToken, async (req, res) => {
+  try {
+    const { firebase_uid, date_from, date_to, status } = req.query;
+    let query = `SELECT e.*, u.name, u.Phone, u.Address 
+                 FROM gym_entries e
+                 LEFT JOIN gym_users u ON e.firebase_uid = u.firebase_uid
+                 WHERE 1=1`;
+    const params = [];
+
+    if (firebase_uid) {
+      query += ' AND e.firebase_uid = ?';
+      params.push(firebase_uid);
+    }
+
+    if (date_from) {
+      query += ' AND DATE(e.entry_time) >= ?';
+      params.push(date_from);
+    }
+
+    if (date_to) {
+      query += ' AND DATE(e.entry_time) <= ?';
+      params.push(date_to);
+    }
+
+    if (status) {
+      query += ' AND e.entry_status = ?';
+      params.push(status);
+    }
+
+    query += ' ORDER BY e.entry_time DESC LIMIT 1000';
+
+    const [rows] = await pool.execute(query, params);
+
+    res.json({
+      success: true,
+      data: rows,
+      count: rows.length
+    });
+  } catch (error) {
+    console.error('Error fetching entries:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching entries',
+      error: error.message
+    });
+  }
+});
+
+// GET user's own entry logs
+app.get('/api/user/entries', verifyFirebaseToken, async (req, res) => {
+  try {
+    const firebase_uid = req.user.uid;
+    const { date_from, date_to } = req.query;
+    
+    let query = 'SELECT * FROM gym_entries WHERE firebase_uid = ?';
+    const params = [firebase_uid];
+
+    if (date_from) {
+      query += ' AND DATE(entry_time) >= ?';
+      params.push(date_from);
+    }
+
+    if (date_to) {
+      query += ' AND DATE(entry_time) <= ?';
+      params.push(date_to);
+    }
+
+    query += ' ORDER BY entry_time DESC LIMIT 100';
+
+    const [rows] = await pool.execute(query, params);
+
+    res.json({
+      success: true,
+      data: rows,
+      count: rows.length
+    });
+  } catch (error) {
+    console.error('Error fetching user entries:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching entries',
+      error: error.message
+    });
+  }
+});
+app.get('/health', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Server is running',
+    timestamp: new Date().toISOString()
+  });
+});
 
 // ==================== SERVER STARTUP ====================
 
