@@ -2564,6 +2564,24 @@ app.get('/api/webauthn/support', (req, res) => {
     }
   });
 });
+app.post('/api/webauthn/register/start', verifyFirebaseToken, async (req, res) => {
+    const { firebase_uid, finger_name } = req.body;
+    // Use fido2-lib to generate options
+    const registrationOptions = await fido2.registrationOptions({ userName: firebase_uid, displayName: finger_name });
+    // Store challenge in session or DB
+    res.json({ success: true, options: registrationOptions });
+});
+app.post('/api/webauthn/register/complete', verifyFirebaseToken, async (req, res) => {
+    const { credential, fingerprint_id } = req.body;
+    // Verify credential with fido2-lib
+    const registrationResult = await fido2.registrationResult(credential);
+    // Store in gym_fingerprints table, using credential as fingerprint_template
+    await pool.execute(
+        'INSERT INTO gym_fingerprints (firebase_uid, fingerprint_template, fingerprint_id, finger_name) VALUES (?, ?, ?, ?)',
+        [req.user.uid, JSON.stringify(credential), fingerprint_id, finger_name]
+    );
+    res.json({ success: true });
+});
 
 
 // ==================== ERROR HANDLING & 404 ====================
