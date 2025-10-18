@@ -2166,6 +2166,404 @@ app.get('/api/user/entries', verifyFirebaseToken, async (req, res) => {
     });
   }
 });
+const crypto = require('crypto');
+
+// Store challenges temporarily (in production, use Redis or database)
+const challenges = new Map();
+
+// Helper: Generate random challenge
+function generateChallenge() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+// Helper: Clean up old challenges (older than 5 minutes)
+function cleanupChallenges() {
+  const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+  for (const [key, value] of challenges.entries()) {
+    if (value.timestamp < fiveMinutesAgo) {
+      challenges.delete(key);
+    }
+  }
+}
+
+setInterval(cleanupChallenges, 60000); // Cleanup every minute
+
+// POST - Start WebAuthn Registration (Enrollment)
+app.post('/api/webauthn/register/start', verifyFirebaseToken, async (req, res) => {
+  try {
+    const { firebase_uid, finger_name } = req.body;
+    const currentUserUid = req.user.uid;
+
+    // Validation
+    if (!firebase_uid) {
+      return res.status(400).json({
+        success: false,
+        message: 'firebase_uid is required'
+      });
+    }
+
+    // Check if user is admin or registering for self
+    const [adminCheck] = await pool.execute(
+      'SELECT is_admin FROM gym_users WHERE firebase_uid = ?',
+      [currentUserUid]
+    );
+    
+    const isAdmin = adminCheck.length > 0 && adminCheck[0].is_admin;
+
+    if (!isAdmin && firebase_uid !== currentUserUid) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: You can only register biometrics for yourself'
+      });
+    }
+
+    // Get user info
+    const [userInfo] = await pool.execute(
+      'SELECT name, Phone FROM gym_users WHERE firebase_uid = ?',
+      [firebase_uid]
+    );
+
+    const userName = userInfo.length > 0 ? (userInfo[0].name || userInfo[0].Phone || firebase_uid) : firebase_uid;
+
+    // Generate challenge
+    const challenge = generateChallenge();
+    challenges.set(firebase_uid, {
+      challenge,
+      timestamp: Date.now(),
+      finger_name: finger_name || 'Biometric'
+    });
+
+    // Create registration options
+    const registrationOptions = {
+      challenge: challenge,
+      rp: {
+        name: "Gym Management System",
+        id: req.get('host').split(':')[0] // Domain without port
+      },
+      user: {
+        id: firebase_uid,
+        name: userName,
+        displayName: userName
+      },
+      pubKeyCredParams: [
+        { alg: -7, type: "public-key" },  // ES256
+        { alg: -257, type: "public-key" } // RS256
+      ],
+      authenticatorSelection: {
+        authenticatorAttachment: "platform", // Built-in biometrics
+        userVerification: "required",
+        requireResidentKey: false
+      },
+      timeout: 60000,
+      attestation: "none"
+    };
+
+    res.json({
+      success: true,
+      options: registrationOptions
+    });
+
+  } catch (error) {
+    console.error('Error starting WebAuthn registration:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error starting registration',
+      error: error.message
+    });
+  }
+});
+
+// POST - Complete WebAuthn Registration (Enrollment)
+app.post('/api/webauthn/register/complete', verifyFirebaseToken, async (req, res) => {
+  try {
+    const { firebase_uid, credential, fingerprint_id } = req.body;
+    const currentUserUid = req.user.uid;
+
+    if (!firebase_uid || !credential || !fingerprint_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'firebase_uid, credential, and fingerprint_id are required'
+      });
+    }
+
+    // Verify challenge
+    const storedChallenge = challenges.get(firebase_uid);
+    if (!storedChallenge) {
+      return res.status(400).json({
+        success: false,
+        message: 'Registration session expired. Please start again.'
+      });
+    }
+
+    // Check if user is admin or registering for self
+    const [adminCheck] = await pool.execute(
+      'SELECT is_admin FROM gym_users WHERE firebase_uid = ?',
+      [currentUserUid]
+    );
+    
+    const isAdmin = adminCheck.length > 0 && adminCheck[0].is_admin;
+
+    if (!isAdmin && firebase_uid !== currentUserUid) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied'
+      });
+    }
+
+    // Store the credential
+    const credentialData = {
+      credentialId: credential.id,
+      publicKey: credential.response.publicKey || credential.rawId,
+      counter: 0
+    };
+
+    // Check if fingerprint_id already exists
+    const [existingFp] = await pool.execute(
+      'SELECT id FROM gym_fingerprints WHERE fingerprint_id = ?',
+      [fingerprint_id]
+    );
+
+    if (existingFp.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'Fingerprint ID already exists'
+      });
+    }
+
+    // Insert into database
+    const [result] = await pool.execute(
+      `INSERT INTO gym_fingerprints 
+       (firebase_uid, fingerprint_template, fingerprint_id, finger_name, is_active) 
+       VALUES (?, ?, ?, ?, 1)`,
+      [
+        firebase_uid,
+        JSON.stringify(credentialData),
+        fingerprint_id,
+        storedChallenge.finger_name
+      ]
+    );
+
+    // Clean up challenge
+    challenges.delete(firebase_uid);
+
+    // Fetch the created fingerprint
+    const [newFingerprint] = await pool.execute(
+      'SELECT * FROM gym_fingerprints WHERE id = ?',
+      [result.insertId]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Biometric enrolled successfully',
+      data: newFingerprint[0]
+    });
+
+  } catch (error) {
+    console.error('Error completing WebAuthn registration:', error);
+    
+    if (error.code === 'ER_NO_REFERENCED_ROW_2') {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid firebase_uid - user does not exist'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: 'Error completing registration',
+      error: error.message
+    });
+  }
+});
+
+// POST - Start WebAuthn Authentication (Verification)
+app.post('/api/webauthn/verify/start', async (req, res) => {
+  try {
+    // Get all active credentials from database
+    const [credentials] = await pool.execute(
+      `SELECT fingerprint_id, fingerprint_template, firebase_uid 
+       FROM gym_fingerprints 
+       WHERE is_active = 1`
+    );
+
+    if (credentials.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No enrolled biometrics found'
+      });
+    }
+
+    // Generate challenge
+    const challenge = generateChallenge();
+    const sessionId = crypto.randomBytes(16).toString('hex');
+    
+    challenges.set(sessionId, {
+      challenge,
+      timestamp: Date.now()
+    });
+
+    // Create authentication options
+    const allowCredentials = credentials.map(cred => {
+      try {
+        const credData = JSON.parse(cred.fingerprint_template);
+        return {
+          id: credData.credentialId,
+          type: 'public-key',
+          transports: ['internal']
+        };
+      } catch (err) {
+        console.warn('Invalid credential data:', err);
+        return null;
+      }
+    }).filter(c => c !== null);
+
+    const authenticationOptions = {
+      challenge: challenge,
+      allowCredentials,
+      timeout: 60000,
+      userVerification: "required"
+    };
+
+    res.json({
+      success: true,
+      sessionId,
+      options: authenticationOptions
+    });
+
+  } catch (error) {
+    console.error('Error starting WebAuthn verification:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error starting verification',
+      error: error.message
+    });
+  }
+});
+
+// POST - Complete WebAuthn Authentication (Verification)
+app.post('/api/webauthn/verify/complete', async (req, res) => {
+  try {
+    const { sessionId, credential } = req.body;
+
+    if (!sessionId || !credential) {
+      return res.status(400).json({
+        success: false,
+        message: 'sessionId and credential are required'
+      });
+    }
+
+    // Verify challenge
+    const storedChallenge = challenges.get(sessionId);
+    if (!storedChallenge) {
+      return res.status(400).json({
+        success: false,
+        message: 'Verification session expired. Please start again.'
+      });
+    }
+
+    // Find matching credential in database
+    const [credentials] = await pool.execute(
+      'SELECT * FROM gym_fingerprints WHERE is_active = 1'
+    );
+
+    let matchedCredential = null;
+    for (const cred of credentials) {
+      try {
+        const credData = JSON.parse(cred.fingerprint_template);
+        if (credData.credentialId === credential.id) {
+          matchedCredential = cred;
+          break;
+        }
+      } catch (err) {
+        console.warn('Invalid credential data:', err);
+      }
+    }
+
+    if (!matchedCredential) {
+      return res.status(404).json({
+        success: false,
+        message: 'Biometric not found or inactive'
+      });
+    }
+
+    // Check if user has active plan
+    const [activePlans] = await pool.execute(
+      `SELECT * FROM gym_plans 
+       WHERE firebase_uid = ? 
+       AND status = 'Active' 
+       AND start_date <= CURDATE() 
+       AND end_date >= CURDATE()`,
+      [matchedCredential.firebase_uid]
+    );
+
+    const hasActivePlan = activePlans.length > 0;
+
+    // Log entry
+    const [entryResult] = await pool.execute(
+      `INSERT INTO gym_entries 
+       (firebase_uid, fingerprint_id, entry_status, has_active_plan) 
+       VALUES (?, ?, ?, ?)`,
+      [
+        matchedCredential.firebase_uid,
+        matchedCredential.fingerprint_id,
+        hasActivePlan ? 'allowed' : 'denied',
+        hasActivePlan ? 1 : 0
+      ]
+    );
+
+    // Get user info
+    const [userInfo] = await pool.execute(
+      'SELECT name, Phone FROM gym_users WHERE firebase_uid = ?',
+      [matchedCredential.firebase_uid]
+    );
+
+    // Get entry details
+    const [entry] = await pool.execute(
+      'SELECT * FROM gym_entries WHERE id = ?',
+      [entryResult.insertId]
+    );
+
+    // Clean up challenge
+    challenges.delete(sessionId);
+
+    res.json({
+      success: true,
+      message: hasActivePlan ? 'Access granted' : 'Access denied - No active plan',
+      data: {
+        entry: entry[0],
+        user: {
+          firebase_uid: matchedCredential.firebase_uid,
+          name: userInfo.length > 0 ? userInfo[0].name : null,
+          phone: userInfo.length > 0 ? userInfo[0].Phone : null
+        },
+        access_granted: hasActivePlan,
+        active_plans: activePlans
+      }
+    });
+
+  } catch (error) {
+    console.error('Error completing WebAuthn verification:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error completing verification',
+      error: error.message
+    });
+  }
+});
+
+// GET - Check WebAuthn support
+app.get('/api/webauthn/support', (req, res) => {
+  res.json({
+    success: true,
+    supported: true,
+    message: 'WebAuthn is supported on this server',
+    features: {
+      platform_authenticator: true,
+      user_verification: true,
+      resident_keys: true
+    }
+  });
+});
 
 
 // ==================== ERROR HANDLING & 404 ====================
